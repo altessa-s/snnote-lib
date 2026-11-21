@@ -1,0 +1,235 @@
+# Copyright 2026 ALTESSA SOLUTIONS INC.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file.
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.cc }} / ${{ matrix.shared && 'shared' || 'static' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        cc: [gcc, clang]
+        shared: [false, true]
+        exclude:
+          # Apple's toolchain is the one clang that ships on macOS runners;
+          # a second compiler there would test the runner, not the library.
+          - os: macos-latest
+            cc: gcc
+    steps:
+      - uses: actions/checkout@v7
+
+      # The runner's own clang is one release too old for C23 `constexpr`;
+      # its gcc, and Apple's clang, are not. The two steps are one decision
+      # spelled twice — the second is the exact negation of the first — and
+      # not a check on `env.CC`, which the `if` context does not reliably see
+      # after a step has written it to GITHUB_ENV.
+      - name: Install a C23 clang
+        if: runner.os == 'Linux' && matrix.cc == 'clang'
+        uses: ./.github/actions/c23-clang
+      - name: Name the compiler
+        if: ${{ !(runner.os == 'Linux' && matrix.cc == 'clang') }}
+        run: echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          echo "CC=$CC"
+          "$CC" --version | head -1
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=${{ matrix.shared && 'ON' || 'OFF' }} \
+            -DSNNOTE_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: cmake --build build --target check
+
+      # The contract and nothing else: the arena and the byte
+      # reader are hidden, so a consumer cannot link against plumbing that is
+      # free to change.
+      - name: Check the exported symbols
+        if: matrix.shared
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]
+          then
+            exported=$(nm -gU build/libsnnote.dylib | awk '{print $3}' | sed 's/^_//' | sort)
+          else
+            exported=$(nm -D --defined-only build/libsnnote.so | awk '{print $3}' | sort)
+          fi
+          echo "$exported"
+          count=$(echo "$exported" | wc -l)
+          # 16 model, 2 parser, 4 raster and 2 logging functions.
+          if [ "$count" -ne 24 ]
+          then
+            echo "expected 24 exported functions, found $count"
+            exit 1
+          fi
+          echo "$exported" > build/exported.txt
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import re
+          headers = "\n".join(path.read_text() for path in Path("include/snnote").glob("*.h"))
+          expected = set(re.findall(r"SN_API[^;]*?\b(sn_\w+)\s*\(", headers, re.S))
+          actual = set(Path("build/exported.txt").read_text().split())
+          assert actual == expected, ("missing", expected - actual, "extra", actual - expected)
+          PYTHON
+
+      # `-std=c2x` and not `-std=c23`: the two name one standard, and gcc 13 —
+      # the runner's gcc — knows only the older spelling. Every compiler CI
+      # builds with takes it; the CMake build above never spells the flag at
+      # all, and lets CMake pick the one the compiler answers to.
+      - name: C++20 consumer
+        run: |
+          if command -v c++ > /dev/null
+          then
+            c++ -std=c++20 tests/consumer.cpp -Iinclude -Lbuild -lsnnote -lm -o build/consumer-cpp
+            LD_LIBRARY_PATH="$PWD/build" DYLD_LIBRARY_PATH="$PWD/build" build/consumer-cpp tests/fixtures/supernote-typescript/heading-n5-20260016-backgrounds-marker.note
+          fi
+
+      - name: Install and consume
+        run: |
+          cmake --install build --prefix "$PWD/stage"
+          cat > /tmp/consumer.c <<'SRC'
+          #include <snnote/snnote.h>
+          #include <stdio.h>
+          int main(void) {
+              sn_palette palette = sn_palette_current();
+              printf("%s\n", SNNOTE_VERSION_STRING);
+              return palette.inks[0x62].alpha == 0 ? 0 : 1;
+          }
+          SRC
+          PKG_CONFIG_PATH="$PWD/stage/lib/pkgconfig:$PWD/stage/lib64/pkgconfig" \
+            "$CC" -std=c2x /tmp/consumer.c \
+            $(PKG_CONFIG_PATH="$PWD/stage/lib/pkgconfig:$PWD/stage/lib64/pkgconfig" pkg-config --static --cflags --libs snnote) \
+            -o /tmp/consumer
+          LD_LIBRARY_PATH="$PWD/stage/lib:$PWD/stage/lib64" DYLD_LIBRARY_PATH="$PWD/stage/lib" /tmp/consumer
+
+  # Windows with clang, not MSVC: the code is C23 throughout — `constexpr`,
+  # `nullptr`, `[[nodiscard]]`, typed enums — and MSVC's C compiler reads none
+  # of it. clang on Windows targets the MSVC ABI and links with its linker and
+  # SDK, which is what the developer-command step puts on the path.
+  windows:
+    name: windows-latest / clang / ${{ matrix.shared && 'shared' || 'static' }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shared: [false, true]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install a C23 clang and Ninja
+        shell: bash
+        run: |
+          choco upgrade llvm ninja -y --no-progress
+          echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
+      - name: Configure
+        shell: bash
+        run: |
+          clang --version | head -1
+          cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=${{ matrix.shared && 'ON' || 'OFF' }} \
+            -DSNNOTE_WERROR=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: cmake --build build --target check
+
+  thread-sanitizer:
+    name: Thread sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/c23-clang
+      - name: Configure
+        run: |
+          cmake -S . -B build-tsan \
+            -DCMAKE_BUILD_TYPE=Debug -DSNNOTE_WERROR=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+      - name: Test concurrent logging and nested callbacks
+        run: |
+          cmake --build build-tsan --target test_log_threads test_budget
+          ctest --test-dir build-tsan --output-on-failure -R '^(log_threads|budget)$'
+
+  sanitizers:
+    name: Address and undefined behaviour
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/c23-clang
+      - name: Configure
+        run: |
+          echo "CC=$CC"
+          "$CC" --version | head -1
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all" \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+      - name: Test
+        run: cmake --build build --target check
+
+  # The suites above prove what the parser reads; this one proves what it does
+  # with bytes nobody wrote. Every `.note` reaches this library off a device and
+  # through a sync, so the input is untrusted in the only sense that matters —
+  # the library did not produce it. The sample fixtures are the
+  # seeds; a crash, a leak or an overflow lands as a failing job with the input
+  # attached.
+  fuzz:
+    name: Fuzz the parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/c23-clang
+      - name: Configure
+        run: |
+          echo "CC=$CC"
+          "$CC" --version | head -1
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DSNNOTE_BUILD_FUZZERS=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+      - name: Build
+        run: cmake --build build --target fuzz_parse seed_corpus
+      - name: Run
+        run: |
+          mkdir -p corpus
+          cp build/seeds/* corpus/
+          cp tests/fixtures/supernote-typescript/*.note tests/fixtures/supernote-typescript/*.mark tests/fixtures/samples/*.note tests/fixtures/samples/*.mark corpus/
+          ./build/fuzz_parse corpus \
+            -max_total_time=120 -max_len=8388608 -print_final_stats=1
+      - name: Keep whatever crashed
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-findings
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+          if-no-files-found: ignore
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The same clang-format release on every machine; .clang-format-ignore
+      # keeps generated and third-party files out.
+      - run: python3 -m pip install clang-format==21.1.8
+      - run: git ls-files '*.c' '*.h' | xargs clang-format --dry-run --Werror

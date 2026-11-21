@@ -1,0 +1,2 @@
+# Keep fixtures, hashes and all test inputs byte-exact on every checkout.
+tests/** -text
